@@ -1,0 +1,63 @@
+name: Play Store Build
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  aab:
+    runs-on: ubuntu-24.04
+    env:
+      KP: ${{ secrets.KEYSTORE_PASSWORD }}
+      PS: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 21 }
+      - name: Create upload key (first run only)
+        run: |
+          test -n "$KP" || { echo "Add the KEYSTORE_PASSWORD secret first"; exit 1; }
+          if [ ! -f upload.jks.enc ]; then
+            keytool -genkeypair -keystore upload.jks -alias upload -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KP" -keypass "$KP" -dname "CN=DG Bazar, O=DG Bazar, C=PK"
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:KP -in upload.jks -out upload.jks.enc
+            rm upload.jks
+            git config user.name github-actions
+            git config user.email actions@github.com
+            git add upload.jks.enc
+            git commit -m "Add encrypted upload key"
+            git push
+          fi
+      - run: unzip -o dg-bazar-app.zip && cp -r dg-bazar/. . && rm -rf dg-bazar
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install
+      - run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_WHATSAPP: ${{ secrets.VITE_WHATSAPP }}
+      - name: Build Android bundle
+        run: |
+          npx cap add android
+          npx capacitor-assets generate --android || echo "icon generation skipped"
+          npx cap sync android
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"1.${{ github.run_number }}\"/" android/app/build.gradle
+          cd android && chmod +x gradlew && ./gradlew bundleRelease
+      - name: Sign bundle
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:KP -in upload.jks.enc -out upload.jks
+          jarsigner -sigalg SHA256withRSA -digestalg SHA-256 -keystore upload.jks -storepass "$KP" -keypass "$KP" android/app/build/outputs/bundle/release/app-release.aab upload
+          mkdir out && cp android/app/build/outputs/bundle/release/app-release.aab out/DG-Bazar.aab
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DG-Bazar-AAB
+          path: out/DG-Bazar.aab
+          retention-days: 14
+      - name: Upload to Google Play internal testing (only if PLAY_SERVICE_ACCOUNT_JSON secret exists)
+        if: env.PS != ''
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: pk.dgbazar.app
+          releaseFiles: out/DG-Bazar.aab
+          track: internal
+          status: draft
